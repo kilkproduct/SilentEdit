@@ -1,22 +1,26 @@
 const plugin = (() => {
-    const Revenge = globalThis.revenge;
+    // Revenge passes the plugin API object as the first argument to the
+    // generated plugin wrapper. Using the wrapper argument directly avoids
+    // depending on a global runtime object.
+    const runtime = arguments[0];
 
-    if (!Revenge) {
-        throw new Error("Revenge runtime was not found");
+    if (!runtime || !runtime.metro || !runtime.api || !runtime.plugin) {
+        throw new Error("Revenge plugin API was not provided");
     }
 
-    const { metro, api, plugin: pluginMeta } = Revenge;
-    const React = metro?.common?.React;
+    const { metro, api, plugin: pluginMeta, ui } = runtime;
+    const React = metro.common?.React;
+    const patcher = api.patcher;
 
-    if (!metro || !React) {
-        throw new Error("Revenge Metro/React API was not found");
+    if (!React) {
+        throw new Error("Revenge React API was not found");
     }
 
-    const patcher = api?.patcher;
-    const storage =
-        typeof pluginMeta?.createStorage === "function"
-            ? pluginMeta.createStorage()
-            : {};
+    if (!patcher) {
+        throw new Error("Revenge patcher was not found");
+    }
+
+    const storage = pluginMeta.createStorage();
 
     const defaults = {
         deleteOriginalMessage: true,
@@ -35,57 +39,38 @@ const plugin = (() => {
     const getSetting = key =>
         storage[key] === undefined ? defaults[key] : storage[key];
 
-    /*
-     * Discord modules
-     */
-    const MessageActions =
-        metro.findByProps("editMessage", "startEditMessage");
+    const LazyActionSheet = metro.findByProps(
+        "openLazy",
+        "hideActionSheet",
+    );
 
-    const MessageStore =
-        metro.findByProps("getMessage");
+    const MessageActions = metro.findByProps(
+        "editMessage",
+        "startEditMessage",
+    );
 
-    const UserStore =
-        metro.findByProps("getCurrentUser");
+    const MessageStore = metro.findByProps("getMessage");
+    const UserStore = metro.findByProps("getCurrentUser");
+    const Constants = metro.findByProps("Endpoints");
+    const RestAPI = metro.findByProps("get", "post", "del");
 
-    const ChannelStore =
-        metro.findByProps("getChannel");
-
-    const Constants =
-        metro.findByProps("Endpoints");
-
-    const RestAPI =
-        metro.findByProps("get", "post", "del");
-
-    const LazyActionSheet =
-        metro.findByProps("openLazy", "hideActionSheet");
-
-    /*
-     * Optional Revenge UI components.
-     * They are only used for settings, never for the message action.
-     */
-    const Forms = Revenge.ui?.components?.Forms || {};
+    const Forms = ui?.components?.Forms || {};
     const FormRow =
-        Forms.FormRow ||
-        metro.findByProps("FormRow")?.FormRow;
-
+        Forms.FormRow || metro.findByProps("FormRow")?.FormRow;
     const FormSwitch =
-        Forms.FormSwitch ||
-        metro.findByProps("FormSwitch")?.FormSwitch;
-
-    let editPatchInstalled = false;
-    let actionPatchInstalled = false;
+        Forms.FormSwitch || metro.findByProps("FormSwitch")?.FormSwitch;
 
     let pendingSilentEdit = null;
     let pendingTimer = null;
 
-    const activeActionSheetPatches = new Set();
+    let editPatchInstalled = false;
+    let actionPatchInstalled = false;
+    let actionSheetPatchInstalling = false;
+    let actionSheetRenderPatched = false;
 
-    /*
-     * Logging
-     */
     function logError(message, error) {
         try {
-            pluginMeta?.logger?.error?.(message, error);
+            pluginMeta.logger.error(message, error);
         } catch {
             console.error("[SilentEdit]", message, error);
         }
@@ -93,15 +78,12 @@ const plugin = (() => {
 
     function logInfo(message) {
         try {
-            pluginMeta?.logger?.info?.(message);
+            pluginMeta.logger.info(message);
         } catch {
             console.log("[SilentEdit]", message);
         }
     }
 
-    /*
-     * Discord helpers
-     */
     function getCurrentUserId() {
         try {
             return UserStore?.getCurrentUser?.()?.id ?? null;
@@ -112,10 +94,7 @@ const plugin = (() => {
 
     function getMessage(channelId, messageId) {
         try {
-            return MessageStore?.getMessage?.(
-                channelId,
-                messageId,
-            ) ?? null;
+            return MessageStore?.getMessage?.(channelId, messageId) ?? null;
         } catch {
             return null;
         }
@@ -123,7 +102,7 @@ const plugin = (() => {
 
     function getMessagesEndpoint(channelId) {
         try {
-            if (Constants?.Endpoints?.MESSAGES) {
+            if (typeof Constants?.Endpoints?.MESSAGES === "function") {
                 return Constants.Endpoints.MESSAGES(channelId);
             }
         } catch (error) {
@@ -135,11 +114,8 @@ const plugin = (() => {
 
     function getMessageEndpoint(channelId, messageId) {
         try {
-            if (Constants?.Endpoints?.MESSAGE) {
-                return Constants.Endpoints.MESSAGE(
-                    channelId,
-                    messageId,
-                );
+            if (typeof Constants?.Endpoints?.MESSAGE === "function") {
+                return Constants.Endpoints.MESSAGE(channelId, messageId);
             }
         } catch (error) {
             logError("Failed to resolve message endpoint", error);
@@ -151,9 +127,6 @@ const plugin = (() => {
     const sleep = ms =>
         new Promise(resolve => setTimeout(resolve, ms));
 
-    /*
-     * Silent message replacement
-     */
     async function sendMessage(
         content,
         nonce,
@@ -161,26 +134,23 @@ const plugin = (() => {
         suppressNotifications,
         messageReference,
     ) {
-        if (!RestAPI?.post) {
+        if (typeof RestAPI?.post !== "function") {
             throw new Error("Discord REST POST API was not found");
         }
 
         const body = {
             content,
-            nonce,
             flags: suppressNotifications ? 4096 : 0,
             mobile_network_type: "unknown",
+            nonce,
             tts: false,
         };
 
         if (messageReference) {
             body.message_reference = {
-                channel_id:
-                    messageReference.channel_id,
-                message_id:
-                    messageReference.message_id,
-                guild_id:
-                    messageReference.guild_id,
+                channel_id: messageReference.channel_id,
+                message_id: messageReference.message_id,
+                guild_id: messageReference.guild_id,
             };
         }
 
@@ -191,15 +161,12 @@ const plugin = (() => {
     }
 
     async function deleteMessage(channelId, messageId) {
-        if (!RestAPI?.del) {
+        if (typeof RestAPI?.del !== "function") {
             throw new Error("Discord REST DELETE API was not found");
         }
 
         return RestAPI.del({
-            url: getMessageEndpoint(
-                channelId,
-                messageId,
-            ),
+            url: getMessageEndpoint(channelId, messageId),
         });
     }
 
@@ -209,10 +176,7 @@ const plugin = (() => {
         content,
         messageReference,
     ) {
-        if (
-            typeof content !== "string" ||
-            content.length === 0
-        ) {
+        if (typeof content !== "string" || content.length === 0) {
             return false;
         }
 
@@ -223,51 +187,32 @@ const plugin = (() => {
                 content,
                 messageId,
                 channelId,
-                Boolean(
-                    getSetting("suppressNotifications"),
-                ),
+                Boolean(getSetting("suppressNotifications")),
                 messageReference,
             );
 
             replacementSent = true;
 
-            const delay =
-                Math.max(
-                    0,
-                    Number(
-                        getSetting("deleteDelay"),
-                    ) || 0,
-                );
+            const delay = Math.max(
+                0,
+                Number(getSetting("deleteDelay")) || 0,
+            );
 
             if (delay > 0) {
                 await sleep(delay);
             }
 
-            if (
-                getSetting(
-                    "deleteOriginalMessage",
-                )
-            ) {
-                await deleteMessage(
-                    channelId,
-                    messageId,
-                );
+            if (getSetting("deleteOriginalMessage")) {
+                await deleteMessage(channelId, messageId);
             }
 
             return true;
         } catch (error) {
-            logError(
-                "Silent edit failed",
-                error,
-            );
-
+            logError("Silent edit failed", error);
             return replacementSent;
         }
     }
 
-    /*
-     * Pending explicit Silent Edit action
-     */
     function clearPendingEdit() {
         pendingSilentEdit = null;
 
@@ -277,10 +222,7 @@ const plugin = (() => {
         }
     }
 
-    function setPendingEdit(
-        channelId,
-        messageId,
-    ) {
+    function setPendingEdit(channelId, messageId) {
         clearPendingEdit();
 
         pendingSilentEdit = {
@@ -288,19 +230,12 @@ const plugin = (() => {
             messageId,
         };
 
-        /*
-         * Prevent a cancelled edit from affecting a later edit.
-         */
         pendingTimer = setTimeout(() => {
             pendingSilentEdit = null;
             pendingTimer = null;
         }, 60_000);
     }
 
-    /*
-     * Discord's editMessage signature can vary slightly.
-     * Support both string and object content.
-     */
     function extractEditContent(args) {
         const candidate = args?.[2];
 
@@ -308,26 +243,18 @@ const plugin = (() => {
             return candidate;
         }
 
-        if (
-            candidate &&
-            typeof candidate.content === "string"
-        ) {
+        if (candidate && typeof candidate.content === "string") {
             return candidate.content;
         }
 
         return null;
     }
 
-    /*
-     * Intercept Discord's actual edit request.
-     *
-     * This is intentionally separate from the UI patch.
-     */
     function installEditPatch() {
         if (
             editPatchInstalled ||
-            !MessageActions?.editMessage ||
-            typeof patcher?.instead !== "function"
+            typeof MessageActions?.editMessage !== "function" ||
+            typeof patcher.instead !== "function"
         ) {
             return;
         }
@@ -339,362 +266,218 @@ const plugin = (() => {
                 try {
                     const channelId = args?.[0];
                     const messageId = args?.[1];
-                    const content =
-                        extractEditContent(args);
+                    const content = extractEditContent(args);
 
-                    /*
-                     * Unknown edit signature:
-                     * allow Discord to handle it normally.
-                     */
-                    if (
-                        !channelId ||
-                        !messageId ||
-                        content === null
-                    ) {
-                        return original.apply(
-                            this,
-                            args,
-                        );
+                    if (!channelId || !messageId || content === null) {
+                        return original.apply(this, args);
                     }
 
-                    /*
-                     * Explicit Silent Edit button.
-                     */
-                    const pending =
-                        pendingSilentEdit;
+                    const pending = pendingSilentEdit;
 
                     if (
                         pending &&
-                        pending.channelId ===
-                            channelId &&
-                        pending.messageId ===
-                            messageId
+                        pending.channelId === channelId &&
+                        pending.messageId === messageId
                     ) {
                         clearPendingEdit();
 
-                        const message =
-                            getMessage(
-                                channelId,
-                                messageId,
-                            );
+                        const message = getMessage(channelId, messageId);
 
                         return silentEditMessage(
                             channelId,
                             messageId,
                             content,
-                            message
-                                ?.messageReference,
+                            message?.messageReference,
                         );
                     }
 
-                    /*
-                     * Optional global interception.
-                     */
-                    if (
-                        getSetting(
-                            "interceptAllEdits",
-                        )
-                    ) {
-                        const message =
-                            getMessage(
-                                channelId,
-                                messageId,
-                            );
-
-                        const currentUserId =
-                            getCurrentUserId();
+                    if (getSetting("interceptAllEdits")) {
+                        const message = getMessage(channelId, messageId);
+                        const currentUserId = getCurrentUserId();
 
                         if (
                             message &&
                             currentUserId &&
-                            message.author?.id ===
-                                currentUserId &&
+                            message.author?.id === currentUserId &&
                             content.length > 0
                         ) {
                             return silentEditMessage(
                                 channelId,
                                 messageId,
                                 content,
-                                message
-                                    .messageReference,
+                                message.messageReference,
                             );
                         }
                     }
                 } catch (error) {
-                    logError(
-                        "Edit interception failed",
-                        error,
-                    );
+                    logError("Edit interception failed", error);
                 }
 
-                return original.apply(
-                    this,
-                    args,
-                );
+                return original.apply(this, args);
             },
         );
 
         editPatchInstalled = true;
     }
 
-    /*
-     * React tree utilities
-     *
-     * We specifically find Discord's EXISTING Edit action and
-     * clone it. This is the important fix for the grey button.
-     */
     function isReactElement(value) {
         return (
-            value &&
+            value !== null &&
             typeof value === "object" &&
-            "props" in value &&
-            "type" in value
+            "type" in value &&
+            "props" in value
         );
     }
 
-    function findExistingEditAction(
-        root,
-        visited = new Set(),
-    ) {
-        if (!root) return null;
+    function getTextPropNames(props) {
+        if (!props || typeof props !== "object") {
+            return [];
+        }
+
+        return [
+            "label",
+            "title",
+            "text",
+            "accessibilityLabel",
+        ].filter(key => typeof props[key] === "string");
+    }
+
+    function isEditActionElement(element) {
+        if (!isReactElement(element)) {
+            return false;
+        }
+
+        const props = element.props || {};
+        const hasPressHandler =
+            typeof props.onPress === "function" ||
+            typeof props.onClick === "function";
+
+        if (!hasPressHandler) {
+            return false;
+        }
+
+        const labels = getTextPropNames(props).map(key =>
+            props[key].trim().toLowerCase(),
+        );
 
         if (
-            typeof root !== "object" &&
-            typeof root !== "function"
+            labels.some(label =>
+                /(^|\b)edit(\b|$)/.test(label),
+            )
         ) {
+            return true;
+        }
+
+        const typeName = String(
+            element.type?.displayName ||
+            element.type?.name ||
+            "",
+        ).toLowerCase();
+
+        return typeName.includes("edit");
+    }
+
+    function findActionArray(root, seen = new Set()) {
+        if (root === null || root === undefined) {
             return null;
         }
 
-        if (visited.has(root)) {
+        if (typeof root !== "object") {
             return null;
         }
 
-        visited.add(root);
+        if (seen.has(root)) {
+            return null;
+        }
 
-        if (isReactElement(root)) {
-            const props = root.props;
+        seen.add(root);
 
-            const possibleLabels = [
-                props?.label,
-                props?.title,
-                props?.text,
-                props?.accessibilityLabel,
-            ];
-
-            const isEditLabel =
-                possibleLabels.some(
-                    value =>
-                        typeof value === "string" &&
-                        value
-                            .trim()
-                            .toLowerCase()
-                            .includes("edit"),
-                );
-
-            const hasPressHandler =
-                typeof props?.onPress ===
-                    "function" ||
-                typeof props?.onClick ===
-                    "function";
-
-            if (
-                isEditLabel &&
-                hasPressHandler
-            ) {
+        if (Array.isArray(root)) {
+            if (root.some(isEditActionElement)) {
                 return root;
             }
-        }
 
-        /*
-         * React children live primarily under props.children,
-         * but Discord's generated trees can also expose arrays
-         * and other nested values.
-         */
-        if (Array.isArray(root)) {
             for (const child of root) {
-                const result =
-                    findExistingEditAction(
-                        child,
-                        visited,
-                    );
-
-                if (result) {
-                    return result;
+                const found = findActionArray(child, seen);
+                if (found) {
+                    return found;
                 }
             }
 
             return null;
         }
 
-        if (
-            typeof root === "object" ||
-            typeof root === "function"
-        ) {
-            if (root.props) {
-                const result =
-                    findExistingEditAction(
-                        root.props,
-                        visited,
-                    );
-
-                if (result) {
-                    return result;
-                }
+        if (isReactElement(root) && root.props) {
+            const found = findActionArray(root.props, seen);
+            if (found) {
+                return found;
             }
+        }
 
-            if (
-                root.children &&
-                root.children !== root
-            ) {
-                const result =
-                    findExistingEditAction(
-                        root.children,
-                        visited,
-                    );
+        if (root.props && root.props !== root) {
+            const found = findActionArray(root.props, seen);
+            if (found) {
+                return found;
+            }
+        }
 
-                if (result) {
-                    return result;
-                }
+        if (root.children && root.children !== root) {
+            const found = findActionArray(root.children, seen);
+            if (found) {
+                return found;
+            }
+        }
+
+        if (root.child && root.child !== root) {
+            const found = findActionArray(root.child, seen);
+            if (found) {
+                return found;
+            }
+        }
+
+        if (root.sibling && root.sibling !== root) {
+            const found = findActionArray(root.sibling, seen);
+            if (found) {
+                return found;
             }
         }
 
         return null;
     }
 
-    function findActionArray(
-        root,
-        visited = new Set(),
-    ) {
-        if (!root || typeof root !== "object") {
-            return null;
-        }
-
-        if (visited.has(root)) {
-            return null;
-        }
-
-        visited.add(root);
-
-        if (Array.isArray(root)) {
-            const containsReactElements =
-                root.some(isReactElement);
-
-            if (containsReactElements) {
-                return root;
-            }
-
-            for (const item of root) {
-                const result =
-                    findActionArray(
-                        item,
-                        visited,
-                    );
-
-                if (result) {
-                    return result;
-                }
-            }
-
-            return null;
-        }
-
-        if (root.props) {
-            const result =
-                findActionArray(
-                    root.props,
-                    visited,
-                );
-
-            if (result) {
-                return result;
-            }
-        }
-
-        return null;
-    }
-
-    function hasSilentEditAction(array) {
+    function hasSilentEdit(array) {
         return array.some(element => {
             if (!isReactElement(element)) {
                 return false;
             }
 
-            const props = element.props;
+            if (element.props?.__silentEdit === true) {
+                return true;
+            }
 
-            return (
-                props?.__silentEdit === true ||
-                (
-                    typeof props?.label ===
-                        "string" &&
-                    props.label
-                        .trim()
-                        .toLowerCase() ===
-                        "silent edit"
-                )
+            const labels = getTextPropNames(element.props).map(key =>
+                String(element.props[key]).trim().toLowerCase(),
             );
+
+            return labels.includes("silent edit");
         });
     }
 
-    function injectSilentEdit(
-        tree,
-        message,
-    ) {
-        const actionArray =
-            findActionArray(tree);
+    function cloneEditAction(editElement, message) {
+        const originalProps = editElement.props || {};
 
-        if (
-            !actionArray ||
-            hasSilentEditAction(actionArray)
-        ) {
-            return false;
-        }
-
-        /*
-         * Find Discord's real Edit item.
-         */
-        const editElement =
-            findExistingEditAction(tree);
-
-        if (!editElement) {
-            logError(
-                "Could not find Discord's native Edit action",
-                null,
-            );
-            return false;
-        }
-
-        const originalProps =
-            editElement.props || {};
-
-        const originalPress =
-            typeof originalProps.onPress ===
-                "function"
-                ? originalProps.onPress
-                : originalProps.onClick;
-
-        /*
-         * Create a completely independent action.
-         *
-         * All styling, icon handling, layout and enabled
-         * behavior come from Discord's existing Edit item.
-         */
-        const silentPress = () => {
-            setPendingEdit(
-                message.channel_id,
-                message.id,
-            );
+        const onSilentPress = () => {
+            setPendingEdit(message.channel_id, message.id);
 
             try {
-                LazyActionSheet?.hideActionSheet?.();
+                if (typeof LazyActionSheet?.hideActionSheet === "function") {
+                    LazyActionSheet.hideActionSheet();
+                }
 
                 if (
-                    typeof MessageActions
-                        ?.startEditMessage !==
-                    "function"
+                    typeof MessageActions?.startEditMessage !== "function"
                 ) {
-                    throw new Error(
-                        "startEditMessage was not found",
-                    );
+                    throw new Error("startEditMessage was not found");
                 }
 
                 MessageActions.startEditMessage(
@@ -704,76 +487,80 @@ const plugin = (() => {
                 );
             } catch (error) {
                 clearPendingEdit();
-
-                /*
-                 * If Discord's native handler can
-                 * safely be called as a fallback,
-                 * don't leave the menu in a broken state.
-                 */
-                try {
-                    if (
-                        typeof originalPress ===
-                        "function"
-                    ) {
-                        originalPress();
-                    }
-                } catch {
-                    // Ignore fallback failure.
-                }
-
-                logError(
-                    "Failed to start Silent Edit",
-                    error,
-                );
+                logError("Failed to open Discord edit UI", error);
             }
         };
 
-        const cloned = React.cloneElement(
-            editElement,
-            {
-                ...originalProps,
+        const nextProps = {
+            ...originalProps,
+            disabled: false,
+            isDisabled: false,
+            __silentEdit: true,
+        };
 
-                /*
-                 * These are deliberately explicit.
-                 * In particular, disabled is forced off.
-                 */
-                disabled: false,
-                isDisabled: false,
+        for (const key of getTextPropNames(originalProps)) {
+            nextProps[key] = "Silent Edit";
+        }
 
-                label: "Silent Edit",
+        if (typeof originalProps.children === "string") {
+            nextProps.children = "Silent Edit";
+        }
 
-                onPress:
-                    typeof originalProps.onPress ===
-                    "function"
-                        ? silentPress
-                        : undefined,
+        if (typeof originalProps.onPress === "function") {
+            nextProps.onPress = onSilentPress;
+        }
 
-                onClick:
-                    typeof originalProps.onPress ===
-                        "function"
-                        ? originalProps.onClick
-                        : silentPress,
+        if (typeof originalProps.onClick === "function") {
+            nextProps.onClick = onSilentPress;
+        }
 
-                /*
-                 * Marker used to prevent duplicate
-                 * insertion into the same sheet.
-                 */
-                __silentEdit: true,
-            },
-        );
+        if (originalProps.key !== undefined) {
+            nextProps.key = "silent-edit";
+        }
 
-        actionArray.push(cloned);
+        return React.cloneElement(editElement, nextProps);
+    }
+
+    function injectSilentEdit(tree, message) {
+        const actionArray = findActionArray(tree);
+
+        if (!actionArray || hasSilentEdit(actionArray)) {
+            return false;
+        }
+
+        const editIndex = actionArray.findIndex(isEditActionElement);
+
+        if (editIndex < 0) {
+            return false;
+        }
+
+        const editElement = actionArray[editIndex];
+        const silentElement = cloneEditAction(editElement, message);
+
+        actionArray.splice(editIndex + 1, 0, silentElement);
         return true;
     }
 
-    /*
-     * Action-sheet patch
-     */
+    function extractActionSheetMessage(args) {
+        const props = args?.[0];
+
+        if (!props || typeof props !== "object") {
+            return null;
+        }
+
+        return (
+            props.message ||
+            props?.props?.message ||
+            props?.route?.params?.message ||
+            null
+        );
+    }
+
     function installActionPatch() {
         if (
             actionPatchInstalled ||
-            !LazyActionSheet?.openLazy ||
-            typeof patcher?.before !== "function"
+            typeof LazyActionSheet?.openLazy !== "function" ||
+            typeof patcher.before !== "function"
         ) {
             return;
         }
@@ -785,127 +572,88 @@ const plugin = (() => {
                 try {
                     const component = args?.[0];
                     const key = args?.[1];
-                    const props = args?.[2];
 
-                    /*
-                     * Only touch Discord's message
-                     * long-press action sheet.
-                     */
+                    if (key !== "MessageLongPressActionSheet") {
+                        return;
+                    }
+
+                    if (!component) {
+                        return;
+                    }
+
                     if (
-                        key !==
-                            "MessageLongPressActionSheet"
+                        actionSheetRenderPatched ||
+                        actionSheetPatchInstalling
                     ) {
                         return;
                     }
 
-                    const message = props?.message;
+                    actionSheetPatchInstalling = true;
 
-                    if (!message) {
-                        return;
-                    }
-
-                    const currentUserId =
-                        getCurrentUserId();
-
-                    /*
-                     * Silent Edit only makes sense for
-                     * the current user's own messages.
-                     */
-                    if (
-                        !currentUserId ||
-                        message.author?.id !==
-                            currentUserId
-                    ) {
-                        return;
-                    }
-
-                    /*
-                     * openLazy receives a Promise for
-                     * the actual action-sheet component.
-                     */
                     Promise.resolve(component)
                         .then(instance => {
                             if (
                                 !instance?.default ||
-                                typeof patcher
-                                    ?.after !==
-                                    "function"
+                                typeof patcher.after !== "function"
                             ) {
                                 return;
                             }
 
-                            /*
-                             * Each opened sheet receives
-                             * its own short-lived patch.
-                             */
-                            let finished = false;
+                            patcher.after(
+                                "default",
+                                instance,
+                                (renderArgs, tree) => {
+                                    try {
+                                        const message =
+                                            extractActionSheetMessage(
+                                                renderArgs,
+                                            );
 
-                            const unpatch =
-                                patcher.after(
-                                    "default",
-                                    instance,
-                                    (_args, tree) => {
-                                        if (finished) {
+                                        if (!message) {
                                             return tree;
                                         }
 
-                                        try {
-                                            injectSilentEdit(
-                                                tree,
-                                                message,
-                                            );
-                                        } catch (
-                                            error
+                                        const currentUserId =
+                                            getCurrentUserId();
+
+                                        if (
+                                            !currentUserId ||
+                                            message.author?.id !==
+                                                currentUserId
                                         ) {
-                                            logError(
-                                                "Failed to inject Silent Edit",
-                                                error,
-                                            );
+                                            return tree;
                                         }
 
-                                        return tree;
-                                    },
-                                );
+                                        injectSilentEdit(
+                                            tree,
+                                            message,
+                                        );
+                                    } catch (error) {
+                                        logError(
+                                            "Failed to inject Silent Edit",
+                                            error,
+                                        );
+                                    }
 
-                            activeActionSheetPatches.add(
-                                unpatch,
+                                    return tree;
+                                },
                             );
 
-                            /*
-                             * The sheet should be long gone
-                             * after this point.
-                             */
-                            setTimeout(() => {
-                                if (finished) {
-                                    return;
-                                }
-
-                                finished = true;
-                                activeActionSheetPatches.delete(
-                                    unpatch,
-                                );
-
-                                try {
-                                    unpatch?.();
-                                } catch (
-                                    error
-                                ) {
-                                    logError(
-                                        "Failed to remove action-sheet patch",
-                                        error,
-                                    );
-                                }
-                            }, 15_000);
+                            actionSheetRenderPatched = true;
                         })
                         .catch(error =>
                             logError(
-                                "Failed to load message action sheet",
+                                "Failed to resolve message action sheet",
                                 error,
                             ),
-                        );
+                        )
+                        .finally(() => {
+                            actionSheetPatchInstalling = false;
+                        });
                 } catch (error) {
+                    actionSheetPatchInstalling = false;
                     logError(
-                        "Message action interception failed",
+                        "Message action-sheet interception failed",
                         error,
                     );
                 }
@@ -915,50 +663,32 @@ const plugin = (() => {
         actionPatchInstalled = true;
     }
 
-    /*
-     * Settings
-     */
-    function settingRow(
-        title,
-        description,
-        value,
-        onToggle,
-    ) {
+    function settingRow(title, description, value, onToggle) {
         if (FormSwitch) {
-            return React.createElement(
-                FormSwitch,
-                {
-                    title,
-                    description,
-                    value: Boolean(value),
-                    onValueChange: onToggle,
-                },
-            );
+            return React.createElement(FormSwitch, {
+                title,
+                description,
+                value: Boolean(value),
+                onValueChange: onToggle,
+            });
         }
 
         if (FormRow) {
-            return React.createElement(
-                FormRow,
-                {
-                    label:
-                        `${title}: ` +
-                        (value ? "On" : "Off"),
-                    subLabel: description,
-                    onPress: () =>
-                        onToggle(!value),
-                },
-            );
+            return React.createElement(FormRow, {
+                label: `${title}: ${value ? "On" : "Off"}`,
+                subLabel: description,
+                onPress: () => onToggle(!value),
+            });
         }
 
         return null;
     }
 
     function SettingsComponent() {
-        const [, forceUpdate] =
-            React.useReducer(
-                value => value + 1,
-                0,
-            );
+        const [, forceUpdate] = React.useReducer(
+            value => value + 1,
+            0,
+        );
 
         const toggle = key => value => {
             storage[key] = value;
@@ -969,83 +699,41 @@ const plugin = (() => {
             settingRow(
                 "Delete original message",
                 "Delete the original server-side message after the silent replacement.",
-                getSetting(
-                    "deleteOriginalMessage",
-                ),
-                toggle(
-                    "deleteOriginalMessage",
-                ),
+                getSetting("deleteOriginalMessage"),
+                toggle("deleteOriginalMessage"),
             ),
-
             settingRow(
                 "Suppress notifications",
                 "Adds the silent notification flag to the replacement message.",
-                getSetting(
-                    "suppressNotifications",
-                ),
-                toggle(
-                    "suppressNotifications",
-                ),
+                getSetting("suppressNotifications"),
+                toggle("suppressNotifications"),
             ),
-
             settingRow(
                 "Intercept all edits",
                 "Silently intercept normal edits too, including Up Arrow editing.",
-                getSetting(
-                    "interceptAllEdits",
-                ),
-                toggle(
-                    "interceptAllEdits",
-                ),
+                getSetting("interceptAllEdits"),
+                toggle("interceptAllEdits"),
             ),
         ].filter(Boolean);
 
         if (FormRow) {
-            const delays = [
-                0,
-                250,
-                500,
-                1000,
-                2000,
-            ];
-
+            const delays = [0, 250, 500, 1000, 2000];
             const currentDelay =
-                Number(
-                    getSetting("deleteDelay"),
-                ) || 0;
-
-            const currentIndex =
-                delays.indexOf(currentDelay);
-
-            const index =
-                currentIndex < 0
-                    ? 0
-                    : currentIndex;
-
+                Number(getSetting("deleteDelay")) || 0;
+            const currentIndex = delays.indexOf(currentDelay);
+            const index = currentIndex < 0 ? 0 : currentIndex;
             const nextDelay =
-                delays[
-                    (index + 1) %
-                        delays.length
-                ];
+                delays[(index + 1) % delays.length];
 
             children.push(
-                React.createElement(
-                    FormRow,
-                    {
-                        label:
-                            `Delete delay: ` +
-                            `${currentDelay} ms`,
-                        subLabel:
-                            `Tap to cycle: ` +
-                            `${delays.join(", ")} ms.`,
-                        onPress: () => {
-                            storage.deleteDelay =
-                                nextDelay;
-
-                            forceUpdate();
-                        },
+                React.createElement(FormRow, {
+                    label: `Delete delay: ${currentDelay} ms`,
+                    subLabel: `Tap to cycle: ${delays.join(", ")} ms.`,
+                    onPress: () => {
+                        storage.deleteDelay = nextDelay;
+                        forceUpdate();
                     },
-                ),
+                }),
             );
 
             const colors = [
@@ -1057,42 +745,23 @@ const plugin = (() => {
                 "#ffffff",
             ];
 
-            const currentColor =
-                getSetting(
-                    "accentColor",
-                );
-
-            const colorIndex =
-                Math.max(
-                    0,
-                    colors.indexOf(
-                        currentColor,
-                    ),
-                );
-
+            const currentColor = getSetting("accentColor");
+            const colorIndex = Math.max(
+                0,
+                colors.indexOf(currentColor),
+            );
             const nextColor =
-                colors[
-                    (colorIndex + 1) %
-                        colors.length
-                ];
+                colors[(colorIndex + 1) % colors.length];
 
             children.push(
-                React.createElement(
-                    FormRow,
-                    {
-                        label:
-                            `Accent color: ` +
-                            `${currentColor}`,
-                        subLabel:
-                            "Tap to cycle presets.",
-                        onPress: () => {
-                            storage.accentColor =
-                                nextColor;
-
-                            forceUpdate();
-                        },
+                React.createElement(FormRow, {
+                    label: `Accent color: ${currentColor}`,
+                    subLabel: "Tap to cycle presets.",
+                    onPress: () => {
+                        storage.accentColor = nextColor;
+                        forceUpdate();
                     },
-                ),
+                }),
             );
         }
 
@@ -1103,9 +772,6 @@ const plugin = (() => {
         );
     }
 
-    /*
-     * Lifecycle
-     */
     return {
         start() {
             if (!MessageActions) {
@@ -1132,14 +798,8 @@ const plugin = (() => {
                 );
             }
 
-            if (!patcher) {
-                throw new Error(
-                    "Revenge patcher was not found",
-                );
-            }
-
-            installActionPatch();
             installEditPatch();
+            installActionPatch();
 
             logInfo("SilentEdit loaded");
         },
@@ -1147,29 +807,10 @@ const plugin = (() => {
         stop() {
             clearPendingEdit();
 
-            for (
-                const unpatch of
-                activeActionSheetPatches
-            ) {
-                try {
-                    unpatch?.();
-                } catch (error) {
-                    logError(
-                        "Failed to remove action-sheet patch",
-                        error,
-                    );
-                }
-            }
-
-            activeActionSheetPatches.clear();
-
-            /*
-             * Revenge's patcher owns the permanent
-             * plugin patches, so stopping the plugin
-             * disposes them normally.
-             */
             editPatchInstalled = false;
             actionPatchInstalled = false;
+            actionSheetPatchInstalling = false;
+            actionSheetRenderPatched = false;
 
             logInfo("SilentEdit unloaded");
         },
@@ -1177,5 +818,3 @@ const plugin = (() => {
         SettingsComponent,
     };
 })();
-
-plugin;
