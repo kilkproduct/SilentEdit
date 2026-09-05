@@ -1,21 +1,16 @@
 {
-  "spec": 3,
-  "type": "plugin",
-  "id": "silent-edit",
-  "version": "1.0.0",
-  "display": {
-    "name": "Silent Edit",
-    "description": "Replace your own Discord messages without using Discord's normal edited-message flow.",
-    "authors": [
-      {
-        "name": "kilk",
-        "id": "1408812084837224488"
-      }
-    ]
-  },
+  "name": "SilentEdit",
+  "description": "\"Silently\" edit your own messages without showing the edited tag.",
+  "authors": [
+    {
+      "name": "kilk",
+      "id": "1408812084837224488"
+    }
+  ],
   "main": "index.js",
-  "extras": {
-    "bunny": {}
+  "vendetta": {
+    "icon": "ic_edit",
+    "original": "nil"
   },
   "hash": "d7843a09f2fdc262c9e5a1a436f6906ccce08d957dd74ebcfcf5789c7c2ff473"
 }
