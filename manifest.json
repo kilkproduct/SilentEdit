@@ -1,0 +1,14 @@
+{
+  "name": "SilentEdit",
+  "description": "\"Silently\" edit your own messages without showing the edited tag.",
+  "authors": [
+    {
+      "name": "kilk",
+      "id": "1408812084837224488"
+    }
+  ],
+  "main": "index.js",
+  "vendetta": {
+    "icon": "ic_edit"
+  }
+}
