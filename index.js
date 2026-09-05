@@ -1,25 +1,10 @@
 const plugin = (() => {
-    // Revenge passes the plugin API object as the first argument to the
-    // generated plugin wrapper. Using the wrapper argument directly avoids
-    // depending on a global runtime object.
     const runtime = arguments[0];
 
-    if (!runtime || !runtime.metro || !runtime.api || !runtime.plugin) {
-        throw new Error("Revenge plugin API was not provided");
-    }
-
     const { metro, api, plugin: pluginMeta, ui } = runtime;
-    const React = metro.common?.React;
+    const { React } = metro.common;
+
     const patcher = api.patcher;
-
-    if (!React) {
-        throw new Error("Revenge React API was not found");
-    }
-
-    if (!patcher) {
-        throw new Error("Revenge patcher was not found");
-    }
-
     const storage = pluginMeta.createStorage();
 
     const defaults = {
@@ -30,19 +15,40 @@ const plugin = (() => {
         accentColor: "#ed4245",
     };
 
-    for (const key of Object.keys(defaults)) {
-        if (storage[key] === undefined) {
-            storage[key] = defaults[key];
+    function getSetting(key) {
+        return storage.get(key, defaults[key]);
+    }
+
+    function setSetting(key, value) {
+        storage.set(key, value);
+    }
+
+    function sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    function logError(message, error) {
+        console.error(`[SilentEdit] ${message}`, error);
+    }
+
+    function getCurrentUserId() {
+        try {
+            return metro.findByProps("getCurrentUser")?.getCurrentUser?.()?.id;
+        } catch {
+            return null;
         }
     }
 
-    const getSetting = key =>
-        storage[key] === undefined ? defaults[key] : storage[key];
-
-    const LazyActionSheet = metro.findByProps(
-        "openLazy",
-        "hideActionSheet",
-    );
+    function getMessage(channelId, messageId) {
+        try {
+            return metro.findByProps("getMessage")?.getMessage?.(
+                channelId,
+                messageId,
+            );
+        } catch {
+            return null;
+        }
+    }
 
     const MessageActions = metro.findByProps(
         "editMessage",
@@ -51,81 +57,38 @@ const plugin = (() => {
 
     const MessageStore = metro.findByProps("getMessage");
     const UserStore = metro.findByProps("getCurrentUser");
+    const ChannelStore = metro.findByProps("getChannel");
     const Constants = metro.findByProps("Endpoints");
+
     const RestAPI = metro.findByProps("get", "post", "del");
 
-    const Forms = ui?.components?.Forms || {};
+    const LazyActionSheet = metro.findByProps(
+        "openLazy",
+        "hideActionSheet",
+    );
+
+    const { Forms = {} } = ui?.components || {};
+
     const FormRow =
-        Forms.FormRow || metro.findByProps("FormRow")?.FormRow;
-    const FormSwitch =
-        Forms.FormSwitch || metro.findByProps("FormSwitch")?.FormSwitch;
+        Forms.FormRow ||
+        metro.findByProps("FormRow")?.FormRow;
+
+    const FormIcon =
+        Forms.FormIcon ||
+        metro.findByProps("FormIcon")?.FormIcon;
 
     let pendingSilentEdit = null;
-    let pendingTimer = null;
-
     let editPatchInstalled = false;
     let actionPatchInstalled = false;
-    let actionSheetPatchInstalling = false;
-    let actionSheetRenderPatched = false;
-
-    function logError(message, error) {
-        try {
-            pluginMeta.logger.error(message, error);
-        } catch {
-            console.error("[SilentEdit]", message, error);
-        }
-    }
-
-    function logInfo(message) {
-        try {
-            pluginMeta.logger.info(message);
-        } catch {
-            console.log("[SilentEdit]", message);
-        }
-    }
-
-    function getCurrentUserId() {
-        try {
-            return UserStore?.getCurrentUser?.()?.id ?? null;
-        } catch {
-            return null;
-        }
-    }
-
-    function getMessage(channelId, messageId) {
-        try {
-            return MessageStore?.getMessage?.(channelId, messageId) ?? null;
-        } catch {
-            return null;
-        }
-    }
 
     function getMessagesEndpoint(channelId) {
-        try {
-            if (typeof Constants?.Endpoints?.MESSAGES === "function") {
-                return Constants.Endpoints.MESSAGES(channelId);
-            }
-        } catch (error) {
-            logError("Failed to resolve messages endpoint", error);
-        }
+        const endpoint =
+            Constants?.Endpoints?.MESSAGES ||
+            Constants?.Endpoints?.CHANNEL_MESSAGES ||
+            "/channels/:channelId/messages";
 
-        return `/channels/${channelId}/messages`;
+        return endpoint.replace(":channelId", channelId);
     }
-
-    function getMessageEndpoint(channelId, messageId) {
-        try {
-            if (typeof Constants?.Endpoints?.MESSAGE === "function") {
-                return Constants.Endpoints.MESSAGE(channelId, messageId);
-            }
-        } catch (error) {
-            logError("Failed to resolve message endpoint", error);
-        }
-
-        return `/channels/${channelId}/messages/${messageId}`;
-    }
-
-    const sleep = ms =>
-        new Promise(resolve => setTimeout(resolve, ms));
 
     async function sendMessage(
         content,
@@ -134,8 +97,8 @@ const plugin = (() => {
         suppressNotifications,
         messageReference,
     ) {
-        if (typeof RestAPI?.post !== "function") {
-            throw new Error("Discord REST POST API was not found");
+        if (!RestAPI?.post) {
+            throw new Error("Discord REST API POST method was not found");
         }
 
         const body = {
@@ -161,12 +124,12 @@ const plugin = (() => {
     }
 
     async function deleteMessage(channelId, messageId) {
-        if (typeof RestAPI?.del !== "function") {
-            throw new Error("Discord REST DELETE API was not found");
+        if (!RestAPI?.del) {
+            throw new Error("Discord REST API DELETE method was not found");
         }
 
         return RestAPI.del({
-            url: getMessageEndpoint(channelId, messageId),
+            url: `${getMessagesEndpoint(channelId)}/${messageId}`,
         });
     }
 
@@ -193,14 +156,12 @@ const plugin = (() => {
 
             replacementSent = true;
 
-            const delay = Math.max(
-                0,
-                Number(getSetting("deleteDelay")) || 0,
+            await sleep(
+                Math.max(
+                    0,
+                    Number(getSetting("deleteDelay")) || 0,
+                ),
             );
-
-            if (delay > 0) {
-                await sleep(delay);
-            }
 
             if (getSetting("deleteOriginalMessage")) {
                 await deleteMessage(channelId, messageId);
@@ -208,32 +169,24 @@ const plugin = (() => {
 
             return true;
         } catch (error) {
-            logError("Silent edit failed", error);
+            logError(
+                "Error while silently editing message",
+                error,
+            );
+
             return replacementSent;
         }
     }
 
-    function clearPendingEdit() {
-        pendingSilentEdit = null;
-
-        if (pendingTimer !== null) {
-            clearTimeout(pendingTimer);
-            pendingTimer = null;
-        }
-    }
-
     function setPendingEdit(channelId, messageId) {
-        clearPendingEdit();
-
         pendingSilentEdit = {
             channelId,
             messageId,
         };
+    }
 
-        pendingTimer = setTimeout(() => {
-            pendingSilentEdit = null;
-            pendingTimer = null;
-        }, 60_000);
+    function clearPendingEdit() {
+        pendingSilentEdit = null;
     }
 
     function extractEditContent(args) {
@@ -243,7 +196,10 @@ const plugin = (() => {
             return candidate;
         }
 
-        if (candidate && typeof candidate.content === "string") {
+        if (
+            candidate &&
+            typeof candidate.content === "string"
+        ) {
             return candidate.content;
         }
 
@@ -253,8 +209,8 @@ const plugin = (() => {
     function installEditPatch() {
         if (
             editPatchInstalled ||
-            typeof MessageActions?.editMessage !== "function" ||
-            typeof patcher.instead !== "function"
+            !MessageActions?.editMessage ||
+            !patcher?.instead
         ) {
             return;
         }
@@ -268,7 +224,11 @@ const plugin = (() => {
                     const messageId = args?.[1];
                     const content = extractEditContent(args);
 
-                    if (!channelId || !messageId || content === null) {
+                    if (
+                        !channelId ||
+                        !messageId ||
+                        content === null
+                    ) {
                         return original.apply(this, args);
                     }
 
@@ -281,7 +241,10 @@ const plugin = (() => {
                     ) {
                         clearPendingEdit();
 
-                        const message = getMessage(channelId, messageId);
+                        const message = getMessage(
+                            channelId,
+                            messageId,
+                        );
 
                         return silentEditMessage(
                             channelId,
@@ -292,13 +255,19 @@ const plugin = (() => {
                     }
 
                     if (getSetting("interceptAllEdits")) {
-                        const message = getMessage(channelId, messageId);
-                        const currentUserId = getCurrentUserId();
+                        const message = getMessage(
+                            channelId,
+                            messageId,
+                        );
+
+                        const currentUserId =
+                            getCurrentUserId();
 
                         if (
                             message &&
                             currentUserId &&
-                            message.author?.id === currentUserId &&
+                            message.author?.id ===
+                                currentUserId &&
                             content.length > 0
                         ) {
                             return silentEditMessage(
@@ -310,7 +279,10 @@ const plugin = (() => {
                         }
                     }
                 } catch (error) {
-                    logError("Edit interception failed", error);
+                    logError(
+                        "Edit interception failed",
+                        error,
+                    );
                 }
 
                 return original.apply(this, args);
@@ -320,247 +292,274 @@ const plugin = (() => {
         editPatchInstalled = true;
     }
 
-    function isReactElement(value) {
-        return (
-            value !== null &&
-            typeof value === "object" &&
-            "type" in value &&
-            "props" in value
-        );
-    }
+    function getNodeLabel(node) {
+        const props = node?.props;
 
-    function getTextPropNames(props) {
-        if (!props || typeof props !== "object") {
-            return [];
-        }
-
-        return [
-            "label",
-            "title",
-            "text",
-            "accessibilityLabel",
-        ].filter(key => typeof props[key] === "string");
-    }
-
-    function isEditActionElement(element) {
-        if (!isReactElement(element)) {
-            return false;
-        }
-
-        const props = element.props || {};
-        const hasPressHandler =
-            typeof props.onPress === "function" ||
-            typeof props.onClick === "function";
-
-        if (!hasPressHandler) {
-            return false;
-        }
-
-        const labels = getTextPropNames(props).map(key =>
-            props[key].trim().toLowerCase(),
-        );
-
-        if (
-            labels.some(label =>
-                /(^|\b)edit(\b|$)/.test(label),
-            )
-        ) {
-            return true;
-        }
-
-        const typeName = String(
-            element.type?.displayName ||
-            element.type?.name ||
-            "",
-        ).toLowerCase();
-
-        return typeName.includes("edit");
-    }
-
-    function findActionArray(root, seen = new Set()) {
-        if (root === null || root === undefined) {
+        if (!props) {
             return null;
         }
 
-        if (typeof root !== "object") {
-            return null;
-        }
+        const candidates = [
+            props.label,
+            props.title,
+            props.text,
+            props.accessibilityLabel,
+            props.accessibilityHint,
+        ];
 
-        if (seen.has(root)) {
-            return null;
-        }
-
-        seen.add(root);
-
-        if (Array.isArray(root)) {
-            if (root.some(isEditActionElement)) {
-                return root;
-            }
-
-            for (const child of root) {
-                const found = findActionArray(child, seen);
-                if (found) {
-                    return found;
-                }
-            }
-
-            return null;
-        }
-
-        if (isReactElement(root) && root.props) {
-            const found = findActionArray(root.props, seen);
-            if (found) {
-                return found;
-            }
-        }
-
-        if (root.props && root.props !== root) {
-            const found = findActionArray(root.props, seen);
-            if (found) {
-                return found;
-            }
-        }
-
-        if (root.children && root.children !== root) {
-            const found = findActionArray(root.children, seen);
-            if (found) {
-                return found;
-            }
-        }
-
-        if (root.child && root.child !== root) {
-            const found = findActionArray(root.child, seen);
-            if (found) {
-                return found;
-            }
-        }
-
-        if (root.sibling && root.sibling !== root) {
-            const found = findActionArray(root.sibling, seen);
-            if (found) {
-                return found;
+        for (const value of candidates) {
+            if (typeof value === "string") {
+                return value;
             }
         }
 
         return null;
     }
 
-    function hasSilentEdit(array) {
-        return array.some(element => {
-            if (!isReactElement(element)) {
-                return false;
-            }
-
-            if (element.props?.__silentEdit === true) {
-                return true;
-            }
-
-            const labels = getTextPropNames(element.props).map(key =>
-                String(element.props[key]).trim().toLowerCase(),
-            );
-
-            return labels.includes("silent edit");
-        });
+    function hasPressHandler(node) {
+        return Boolean(
+            node?.props &&
+            (
+                typeof node.props.onPress === "function" ||
+                typeof node.props.onClick === "function"
+            ),
+        );
     }
 
-    function cloneEditAction(editElement, message) {
-        const originalProps = editElement.props || {};
+    function isEditAction(node) {
+        if (!node || typeof node !== "object") {
+            return false;
+        }
 
-        const onSilentPress = () => {
-            setPendingEdit(message.channel_id, message.id);
+        const label = getNodeLabel(node);
+
+        if (
+            typeof label === "string" &&
+            /\bedit\b/i.test(label)
+        ) {
+            return hasPressHandler(node);
+        }
+
+        const typeName =
+            node?.type?.displayName ||
+            node?.type?.name ||
+            "";
+
+        if (
+            typeof typeName === "string" &&
+            /\bedit\b/i.test(typeName)
+        ) {
+            return hasPressHandler(node);
+        }
+
+        return false;
+    }
+
+    function findEditAction(tree) {
+        let result = null;
+
+        function walk(node, parentArray) {
+            if (result) {
+                return;
+            }
+
+            if (!node || typeof node !== "object") {
+                return;
+            }
+
+            if (Array.isArray(node)) {
+                for (const child of node) {
+                    walk(child, node);
+
+                    if (result) {
+                        return;
+                    }
+                }
+
+                return;
+            }
+
+            if (isEditAction(node)) {
+                result = {
+                    node,
+                    parentArray,
+                };
+
+                return;
+            }
+
+            const props = node.props;
+
+            if (!props) {
+                return;
+            }
+
+            if (Array.isArray(props.children)) {
+                walk(props.children, props.children);
+
+                if (result) {
+                    return;
+                }
+            } else if (props.children) {
+                walk(props.children, parentArray);
+
+                if (result) {
+                    return;
+                }
+            }
+        }
+
+        walk(tree, null);
+
+        return result;
+    }
+
+    function replaceText(value) {
+        if (typeof value !== "string") {
+            return value;
+        }
+
+        if (/\bedit\b/i.test(value)) {
+            return "Silent Edit";
+        }
+
+        return value;
+    }
+
+    function makeSilentEditAction(originalAction, message) {
+        const originalProps = originalAction?.props;
+
+        if (!originalProps) {
+            return null;
+        }
+
+        const handlePress = () => {
+            setPendingEdit(
+                message.channel_id,
+                message.id,
+            );
 
             try {
-                if (typeof LazyActionSheet?.hideActionSheet === "function") {
-                    LazyActionSheet.hideActionSheet();
-                }
+                LazyActionSheet?.hideActionSheet?.();
 
-                if (
-                    typeof MessageActions?.startEditMessage !== "function"
-                ) {
-                    throw new Error("startEditMessage was not found");
-                }
-
-                MessageActions.startEditMessage(
+                MessageActions?.startEditMessage?.(
                     message.channel_id,
                     message.id,
                     message.content,
                 );
             } catch (error) {
                 clearPendingEdit();
-                logError("Failed to open Discord edit UI", error);
+
+                logError(
+                    "Failed to open Discord edit UI",
+                    error,
+                );
             }
         };
 
-        const nextProps = {
+        const newProps = {
             ...originalProps,
+
+            label: replaceText(originalProps.label),
+            title: replaceText(originalProps.title),
+            text: replaceText(originalProps.text),
+            accessibilityLabel: replaceText(
+                originalProps.accessibilityLabel,
+            ),
+
+            onPress: handlePress,
+            onClick: handlePress,
+
             disabled: false,
             isDisabled: false,
+
             __silentEdit: true,
         };
 
-        for (const key of getTextPropNames(originalProps)) {
-            nextProps[key] = "Silent Edit";
-        }
-
-        if (typeof originalProps.children === "string") {
-            nextProps.children = "Silent Edit";
-        }
-
-        if (typeof originalProps.onPress === "function") {
-            nextProps.onPress = onSilentPress;
-        }
-
-        if (typeof originalProps.onClick === "function") {
-            nextProps.onClick = onSilentPress;
-        }
-
-        if (originalProps.key !== undefined) {
-            nextProps.key = "silent-edit";
-        }
-
-        return React.cloneElement(editElement, nextProps);
+        return React.cloneElement(
+            originalAction,
+            newProps,
+        );
     }
 
     function injectSilentEdit(tree, message) {
-        const actionArray = findActionArray(tree);
-
-        if (!actionArray || hasSilentEdit(actionArray)) {
-            return false;
+        if (!tree || !message) {
+            return tree;
         }
 
-        const editIndex = actionArray.findIndex(isEditActionElement);
+        const currentUserId = getCurrentUserId();
 
-        if (editIndex < 0) {
-            return false;
+        if (
+            !currentUserId ||
+            message.author?.id !== currentUserId
+        ) {
+            return tree;
         }
 
-        const editElement = actionArray[editIndex];
-        const silentElement = cloneEditAction(editElement, message);
+        const found = findEditAction(tree);
 
-        actionArray.splice(editIndex + 1, 0, silentElement);
-        return true;
+        if (
+            !found ||
+            !found.node ||
+            !found.parentArray
+        ) {
+            return tree;
+        }
+
+        const parent = found.parentArray;
+
+        if (
+            parent.some(
+                child =>
+                    child?.props?.__silentEdit === true,
+            )
+        ) {
+            return tree;
+        }
+
+        const silentAction = makeSilentEditAction(
+            found.node,
+            message,
+        );
+
+        if (!silentAction) {
+            return tree;
+        }
+
+        const index = parent.indexOf(found.node);
+
+        if (index < 0) {
+            return tree;
+        }
+
+        parent.splice(index + 1, 0, silentAction);
+
+        return tree;
     }
 
-    function extractActionSheetMessage(args) {
-        const props = args?.[0];
+    function getMessageFromRenderArgs(args) {
+        const first = args?.[0];
 
-        if (!props || typeof props !== "object") {
+        if (!first) {
             return null;
         }
 
-        return (
-            props.message ||
-            props?.props?.message ||
-            props?.route?.params?.message ||
-            null
-        );
+        if (first.message) {
+            return first.message;
+        }
+
+        if (first.props?.message) {
+            return first.props.message;
+        }
+
+        return null;
     }
 
     function installActionPatch() {
         if (
             actionPatchInstalled ||
-            typeof LazyActionSheet?.openLazy !== "function" ||
-            typeof patcher.before !== "function"
+            !LazyActionSheet?.openLazy ||
+            !patcher?.before
         ) {
             return;
         }
@@ -569,252 +568,241 @@ const plugin = (() => {
             "openLazy",
             LazyActionSheet,
             args => {
-                try {
-                    const component = args?.[0];
-                    const key = args?.[1];
+                const component = args?.[0];
+                const key = args?.[1];
 
-                    if (key !== "MessageLongPressActionSheet") {
-                        return;
-                    }
+                if (
+                    key !==
+                    "MessageLongPressActionSheet"
+                ) {
+                    return;
+                }
 
-                    if (!component) {
-                        return;
-                    }
+                if (!component) {
+                    return;
+                }
 
-                    if (
-                        actionSheetRenderPatched ||
-                        actionSheetPatchInstalling
-                    ) {
-                        return;
-                    }
+                Promise.resolve(component)
+                    .then(instance => {
+                        if (
+                            !instance?.default ||
+                            typeof patcher.after !==
+                                "function"
+                        ) {
+                            return;
+                        }
 
-                    actionSheetPatchInstalling = true;
+                        if (
+                            instance.__silentEditPatched
+                        ) {
+                            return;
+                        }
 
-                    Promise.resolve(component)
-                        .then(instance => {
-                            if (
-                                !instance?.default ||
-                                typeof patcher.after !== "function"
-                            ) {
-                                return;
-                            }
+                        instance.__silentEditPatched =
+                            true;
 
-                            patcher.after(
-                                "default",
-                                instance,
-                                (renderArgs, tree) => {
-                                    try {
-                                        const message =
-                                            extractActionSheetMessage(
-                                                renderArgs,
-                                            );
-
-                                        if (!message) {
-                                            return tree;
-                                        }
-
-                                        const currentUserId =
-                                            getCurrentUserId();
-
-                                        if (
-                                            !currentUserId ||
-                                            message.author?.id !==
-                                                currentUserId
-                                        ) {
-                                            return tree;
-                                        }
-
-                                        injectSilentEdit(
-                                            tree,
-                                            message,
+                        patcher.after(
+                            "default",
+                            instance,
+                            (renderArgs, tree) => {
+                                try {
+                                    const message =
+                                        getMessageFromRenderArgs(
+                                            renderArgs,
                                         );
-                                    } catch (error) {
-                                        logError(
-                                            "Failed to inject Silent Edit",
-                                            error,
-                                        );
+
+                                    if (!message) {
+                                        return tree;
                                     }
 
-                                    return tree;
-                                },
-                            );
+                                    return injectSilentEdit(
+                                        tree,
+                                        message,
+                                    );
+                                } catch (error) {
+                                    logError(
+                                        "Failed to inject Silent Edit action",
+                                        error,
+                                    );
 
-                            actionSheetRenderPatched = true;
-                        })
-                        .catch(error =>
-                            logError(
-                                "Failed to resolve message action sheet",
-                                error,
-                            ),
-                        )
-                        .finally(() => {
-                            actionSheetPatchInstalling = false;
-                        });
-                } catch (error) {
-                    actionSheetPatchInstalling = false;
-                    logError(
-                        "Message action-sheet interception failed",
-                        error,
-                    );
-                }
+                                    return tree;
+                                }
+                            },
+                        );
+                    })
+                    .catch(error => {
+                        logError(
+                            "Failed to load message action sheet",
+                            error,
+                        );
+                    });
             },
         );
 
         actionPatchInstalled = true;
     }
 
-    function settingRow(title, description, value, onToggle) {
-        if (FormSwitch) {
-            return React.createElement(FormSwitch, {
-                title,
-                description,
-                value: Boolean(value),
-                onValueChange: onToggle,
-            });
-        }
-
-        if (FormRow) {
-            return React.createElement(FormRow, {
-                label: `${title}: ${value ? "On" : "Off"}`,
-                subLabel: description,
-                onPress: () => onToggle(!value),
-            });
-        }
-
-        return null;
-    }
-
     function SettingsComponent() {
-        const [, forceUpdate] = React.useReducer(
-            value => value + 1,
-            0,
-        );
+        const React = metro.common.React;
 
-        const toggle = key => value => {
-            storage[key] = value;
-            forceUpdate();
-        };
-
-        const children = [
-            settingRow(
-                "Delete original message",
-                "Delete the original server-side message after the silent replacement.",
-                getSetting("deleteOriginalMessage"),
-                toggle("deleteOriginalMessage"),
-            ),
-            settingRow(
-                "Suppress notifications",
-                "Adds the silent notification flag to the replacement message.",
-                getSetting("suppressNotifications"),
-                toggle("suppressNotifications"),
-            ),
-            settingRow(
-                "Intercept all edits",
-                "Silently intercept normal edits too, including Up Arrow editing.",
-                getSetting("interceptAllEdits"),
-                toggle("interceptAllEdits"),
-            ),
-        ].filter(Boolean);
-
-        if (FormRow) {
-            const delays = [0, 250, 500, 1000, 2000];
-            const currentDelay =
-                Number(getSetting("deleteDelay")) || 0;
-            const currentIndex = delays.indexOf(currentDelay);
-            const index = currentIndex < 0 ? 0 : currentIndex;
-            const nextDelay =
-                delays[(index + 1) % delays.length];
-
-            children.push(
-                React.createElement(FormRow, {
-                    label: `Delete delay: ${currentDelay} ms`,
-                    subLabel: `Tap to cycle: ${delays.join(", ")} ms.`,
-                    onPress: () => {
-                        storage.deleteDelay = nextDelay;
-                        forceUpdate();
-                    },
-                }),
+        const [deleteOriginalMessage, setDeleteOriginalMessage] =
+            React.useState(
+                Boolean(
+                    getSetting("deleteOriginalMessage"),
+                ),
             );
 
-            const colors = [
-                "#ed4245",
-                "#5865f2",
-                "#57f287",
-                "#fee75c",
-                "#eb459e",
-                "#ffffff",
-            ];
-
-            const currentColor = getSetting("accentColor");
-            const colorIndex = Math.max(
-                0,
-                colors.indexOf(currentColor),
+        const [suppressNotifications, setSuppressNotifications] =
+            React.useState(
+                Boolean(
+                    getSetting("suppressNotifications"),
+                ),
             );
-            const nextColor =
-                colors[(colorIndex + 1) % colors.length];
 
-            children.push(
-                React.createElement(FormRow, {
-                    label: `Accent color: ${currentColor}`,
-                    subLabel: "Tap to cycle presets.",
-                    onPress: () => {
-                        storage.accentColor = nextColor;
-                        forceUpdate();
-                    },
-                }),
+        const [interceptAllEdits, setInterceptAllEdits] =
+            React.useState(
+                Boolean(
+                    getSetting("interceptAllEdits"),
+                ),
             );
-        }
+
+        const [deleteDelay, setDeleteDelay] =
+            React.useState(
+                String(getSetting("deleteDelay")),
+            );
+
+        const updateBoolean =
+            (key, setter) => value => {
+                setter(value);
+                setSetting(key, value);
+            };
 
         return React.createElement(
             React.Fragment,
             null,
-            ...children,
+
+            FormRow &&
+                React.createElement(FormRow, {
+                    label: "Delete original message",
+                    trailing:
+                        Forms.FormSwitch &&
+                        React.createElement(
+                            Forms.FormSwitch,
+                            {
+                                value:
+                                    deleteOriginalMessage,
+                                onValueChange:
+                                    updateBoolean(
+                                        "deleteOriginalMessage",
+                                        setDeleteOriginalMessage,
+                                    ),
+                            },
+                        ),
+                }),
+
+            FormRow &&
+                React.createElement(FormRow, {
+                    label: "Delete delay (ms)",
+                    trailing:
+                        Forms.FormInput &&
+                        React.createElement(
+                            Forms.FormInput,
+                            {
+                                value: deleteDelay,
+                                onChange: value => {
+                                    setDeleteDelay(
+                                        String(value),
+                                    );
+
+                                    const parsed =
+                                        Number(value);
+
+                                    if (
+                                        Number.isFinite(
+                                            parsed,
+                                        )
+                                    ) {
+                                        setSetting(
+                                            "deleteDelay",
+                                            Math.max(
+                                                0,
+                                                parsed,
+                                            ),
+                                        );
+                                    }
+                                },
+                            },
+                        ),
+                }),
+
+            FormRow &&
+                React.createElement(FormRow, {
+                    label: "Suppress notifications",
+                    trailing:
+                        Forms.FormSwitch &&
+                        React.createElement(
+                            Forms.FormSwitch,
+                            {
+                                value:
+                                    suppressNotifications,
+                                onValueChange:
+                                    updateBoolean(
+                                        "suppressNotifications",
+                                        setSuppressNotifications,
+                                    ),
+                            },
+                        ),
+                }),
+
+            FormRow &&
+                React.createElement(FormRow, {
+                    label: "Intercept all edits",
+                    trailing:
+                        Forms.FormSwitch &&
+                        React.createElement(
+                            Forms.FormSwitch,
+                            {
+                                value:
+                                    interceptAllEdits,
+                                onValueChange:
+                                    updateBoolean(
+                                        "interceptAllEdits",
+                                        setInterceptAllEdits,
+                                    ),
+                            },
+                        ),
+                }),
         );
     }
 
     return {
+        name: "SilentEdit",
+
+        description:
+            '"Silently" edit your own messages without showing the edited tag.',
+
+        authors: [
+            {
+                name: "kilk",
+                id: "1408812084837224488",
+            },
+        ],
+
+        SettingsComponent,
+
         start() {
-            if (!MessageActions) {
-                throw new Error(
-                    "Discord message action module was not found",
-                );
-            }
-
-            if (!MessageStore) {
-                throw new Error(
-                    "Discord message store was not found",
-                );
-            }
-
-            if (!UserStore) {
-                throw new Error(
-                    "Discord user store was not found",
-                );
-            }
-
-            if (!RestAPI) {
-                throw new Error(
-                    "Discord REST API module was not found",
-                );
-            }
-
             installEditPatch();
             installActionPatch();
-
-            logInfo("SilentEdit loaded");
         },
 
         stop() {
             clearPendingEdit();
 
+            // Patches created through the plugin API are
+            // automatically disposed by the host when
+            // the plugin stops.
             editPatchInstalled = false;
             actionPatchInstalled = false;
-            actionSheetPatchInstalling = false;
-            actionSheetRenderPatched = false;
-
-            logInfo("SilentEdit unloaded");
         },
-
-        SettingsComponent,
     };
 })();
